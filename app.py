@@ -1,13 +1,12 @@
 """
-GADIANI DJEN Proxy Server
-Deploy no Render.com (free tier) - busca publicacoes PJe sem restricao CORS
+GADIANI DJEN Proxy Server v2
 """
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import requests, os
+import requests, os, json
 
 app = Flask(__name__)
-CORS(app)  # permite qualquer origem
+CORS(app)
 
 PJE_BASE = "https://comunica.pje.jus.br/api/v1/comunicacao"
 
@@ -21,7 +20,44 @@ HEADERS = {
 
 @app.route("/")
 def index():
-    return jsonify({"ok": True, "service": "Gadiani DJEN Proxy", "version": "1.0"})
+    return jsonify({"ok": True, "service": "Gadiani DJEN Proxy", "version": "2.0"})
+
+@app.route("/diagnostico")
+def diagnostico():
+    """Testa a conexao com o PJe e mostra resposta bruta"""
+    oab = request.args.get("oab", "425910")
+    uf  = request.args.get("uf", "SP")
+    ini = request.args.get("ini", "2026-05-14")
+    fim = request.args.get("fim", "2026-05-16")
+
+    url = PJE_BASE
+    params = {
+        "dataDisponibilizacaoInicio": ini,
+        "dataDisponibilizacaoFim":    fim,
+        "numeroOab": oab,
+        "ufOab":     uf,
+        "page":      0,
+        "size":      5
+    }
+
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=20)
+        try:
+            body_json = r.json()
+        except:
+            body_json = None
+
+        return jsonify({
+            "ok":          True,
+            "http_status": r.status_code,
+            "url_chamada": r.url,
+            "headers_resp": dict(r.headers),
+            "body_raw":    r.text[:2000],
+            "body_json":   body_json,
+            "params_usados": params
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "params": params})
 
 @app.route("/djen")
 def djen():
@@ -37,6 +73,7 @@ def djen():
     pagina = 0
     total_paginas = 1
     erros = []
+    debug = []
 
     while pagina < total_paginas and pagina < 50:
         params = {
@@ -48,13 +85,34 @@ def djen():
             "size":      20
         }
         try:
-            r = requests.get(PJE_BASE, params=params, headers=HEADERS, timeout=15)
+            r = requests.get(PJE_BASE, params=params, headers=HEADERS, timeout=20)
+            debug.append(f"p{pagina}: HTTP {r.status_code}, url={r.url}")
+
             if r.status_code != 200:
-                erros.append(f"p{pagina}: HTTP {r.status_code}")
+                # Tentar ler o corpo mesmo com erro
+                erros.append(f"p{pagina}: HTTP {r.status_code} corpo={r.text[:200]}")
                 break
+
+            raw = r.text.strip()
+            debug.append(f"p{pagina}: body[100]={raw[:100]}")
+
+            if not raw:
+                erros.append(f"p{pagina}: resposta vazia")
+                break
+
             data = r.json()
-            items = (data.get("content") or data.get("data") or
-                     data.get("resultado") or (data if isinstance(data, list) else []))
+
+            # Suporte a varios formatos de resposta
+            items = []
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict):
+                items = (data.get("content") or data.get("data") or
+                         data.get("resultado") or data.get("result") or
+                         data.get("comunicacoes") or [])
+
+            debug.append(f"p{pagina}: {len(items)} itens encontrados")
+
             for it in items:
                 todas.append({
                     "id":              str(it.get("id") or it.get("idComunicacao") or f"{oab}_{pagina}_{len(todas)}"),
@@ -67,10 +125,14 @@ def djen():
                     "oab": oab, "uf": uf,
                     "dataDisponibilizacao": it.get("dataDisponibilizacao") or ini
                 })
-            total_paginas = data.get("totalPages") or data.get("totalPaginas") or 1
+
+            total_paginas = (data.get("totalPages") or data.get("totalPaginas") or
+                            data.get("total_pages") or 1) if isinstance(data, dict) else 1
             pagina += 1
+
         except Exception as e:
             erros.append(f"p{pagina}: {str(e)}")
+            debug.append(f"p{pagina}: EXCECAO {str(e)}")
             break
 
     return jsonify({
@@ -80,7 +142,8 @@ def djen():
         "oab":   oab,
         "ini":   ini,
         "fim":   fim,
-        "erros": erros
+        "erros": erros,
+        "debug": debug
     })
 
 if __name__ == "__main__":
